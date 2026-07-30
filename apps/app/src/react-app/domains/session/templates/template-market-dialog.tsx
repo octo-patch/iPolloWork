@@ -33,11 +33,16 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { t } from "@/i18n";
+import { currentLocale, t } from "@/i18n";
 import { cn } from "@/lib/utils";
 import type { WorkContextId } from "@/app/lib/work-context";
 import type { EnterpriseConnection, EnterpriseResource } from "@/app/lib/enterprise-connections";
 import { WorkResourceScopeSwitch } from "@/react-app/domains/enterprise/work-resource-scope-switch";
+import {
+  localizedTemplateDescription,
+  localizedTemplateTags,
+  localizedTemplateTitle,
+} from "./template-localization";
 
 type TemplateCoverLoader = (templateId: string) => Promise<{ data: ArrayBuffer; contentType?: string | null }>;
 
@@ -71,7 +76,17 @@ function templateMatches(input: { template: TemplateCatalogItem; category: Templ
   if (style !== "all" && template.manifest.style !== style) return false;
   if (source === "mine" && template.sourceType !== "local") return false;
   if (!query) return true;
-  return [template.manifest.title, template.manifest.description, template.manifest.subcategory, template.manifest.style, ...template.manifest.tags]
+  const locale = currentLocale();
+  return [
+    localizedTemplateTitle(template.manifest, locale),
+    localizedTemplateDescription(template.manifest, locale),
+    template.manifest.title,
+    template.manifest.description,
+    template.manifest.subcategory,
+    template.manifest.style,
+    ...localizedTemplateTags(template.manifest, locale),
+    ...template.manifest.tags,
+  ]
     .join(" ").toLowerCase().includes(query);
 }
 
@@ -134,10 +149,11 @@ function TemplateCover({ template, getCover, className, alt = "", eager = false 
   }, [getCover, retry, shouldLoad, template.installedVersion, template.manifest.id, template.manifest.version]);
   if (!shouldLoad) return <div ref={placeholderRef} data-template-cover-lazy className={cn("h-full w-full bg-muted", className)} />;
   if (failed) {
+    const title = localizedTemplateTitle(template.manifest, currentLocale());
     return (
       <div className={cn("grid h-full w-full place-items-center bg-muted p-4 text-center", className)}>
         <div className="max-w-full">
-          <p className="truncate text-xs font-medium text-foreground">{template.manifest.title}</p>
+          <p className="truncate text-xs font-medium text-foreground">{title}</p>
           <p className="mt-1 text-[11px] text-muted-foreground">{t("template_market.cover_failed")}</p>
           <Button type="button" variant="outline" size="sm" className="mt-3 h-7 rounded-lg px-2 text-[11px]" onClick={(event) => { event.stopPropagation(); setRetry((value) => value + 1); }}>
             {t("template_market.retry_cover")}
@@ -263,13 +279,14 @@ export function TemplateMarketDialog(props: TemplateMarketDialogProps) {
     </Dialog>
     <Dialog open={Boolean(previewTemplate)} onOpenChange={(open) => { if (!open) setPreviewTemplate(null); }}>
       <DialogContent showCloseButton className="max-w-[960px] gap-0 overflow-hidden p-0 sm:max-w-[960px]">
-        {previewTemplate ? <>
-          <div className="aspect-video overflow-hidden bg-muted"><TemplateCover template={previewTemplate} getCover={props.getCover} alt={t("template_market.preview_alt", { title: previewTemplate.manifest.title })} eager /></div>
-          <div className="flex flex-col gap-4 border-t border-border px-6 py-5 sm:flex-row sm:items-end sm:justify-between">
-            <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><DialogTitle className="text-lg">{previewTemplate.manifest.title}</DialogTitle>{isPptxCompatibleTemplate(previewTemplate.manifest) ? <Badge className="text-[10px]">{t("template_market.pptx_compatible")}</Badge> : null}<Badge variant="outline" className="text-[10px]">{t(CATEGORIES.find((item) => item.id === previewTemplate.manifest.category)?.labelKey ?? "template_market.category.other")}</Badge><Badge variant="outline" className="text-[10px]">{templateStyleLabel(previewTemplate.manifest.style)}</Badge></div><DialogDescription className="mt-2 max-w-2xl text-xs leading-5">{previewTemplate.manifest.description}</DialogDescription><p className="mt-2 text-[10px] text-muted-foreground">{previewTemplate.manifest.source.name} / {previewTemplate.manifest.source.license}</p></div>
-            <div className="flex shrink-0 items-center gap-2"><Button variant="outline" size="sm" className="rounded-xl" onClick={() => setPreviewTemplate(null)}>{t("common.back")}</Button><Button size="sm" className="rounded-xl" disabled={props.busyId !== null} onClick={() => { if (previewTemplate.updateAvailable || !previewTemplate.installed) props.onInstall(previewTemplate.manifest.id); else { const template = previewTemplate; setPreviewTemplate(null); props.onUse(template); } }}>{props.busyId === previewTemplate.manifest.id ? <Loader2 className="size-3.5 animate-spin" /> : null}{previewTemplate.updateAvailable ? t("template_market.update_template") : previewTemplate.installed ? t("template_market.use_template") : t("template_market.install_template")}</Button></div>
-          </div>
-        </> : null}
+        {previewTemplate ? <TemplatePreview
+          template={previewTemplate}
+          getCover={props.getCover}
+          busyId={props.busyId}
+          onBack={() => setPreviewTemplate(null)}
+          onInstall={() => props.onInstall(previewTemplate.manifest.id)}
+          onUse={() => { const template = previewTemplate; setPreviewTemplate(null); props.onUse(template); }}
+        /> : null}
       </DialogContent>
     </Dialog>
     </>
@@ -280,9 +297,52 @@ function EnterpriseTemplateCard({ resource, busy, onInstall }: { resource: Enter
   return <article className="overflow-hidden rounded-2xl border border-border bg-card p-4 shadow-sm"><div className="flex items-start gap-3"><div className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary"><Building2 className="size-4" /></div><div className="min-w-0 flex-1"><h3 className="truncate text-sm font-semibold">{resource.name}</h3><p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{resource.description}</p></div></div><div className="mt-4 flex items-center justify-between gap-2"><div className="flex min-w-0 gap-1.5"><Badge variant="outline" className="truncate text-[10px]">{resource.enterpriseCategory}</Badge>{resource.latestVersion ? <Badge variant="secondary" className="text-[10px]">v{resource.latestVersion.version}</Badge> : null}</div><Button size="sm" className="h-7 rounded-lg px-2.5 text-[11px]" disabled={busy || !resource.latestVersion} onClick={onInstall}>{busy ? <Loader2 className="size-3 animate-spin" /> : null}{t("enterprise_connection.install_from_enterprise")}</Button></div></article>;
 }
 
+function TemplatePreview({ template, getCover, busyId, onBack, onInstall, onUse }: {
+  template: TemplateCatalogItem;
+  getCover: TemplateCoverLoader;
+  busyId: string | null;
+  onBack: () => void;
+  onInstall: () => void;
+  onUse: () => void;
+}) {
+  const locale = currentLocale();
+  const title = localizedTemplateTitle(template.manifest, locale);
+  const description = localizedTemplateDescription(template.manifest, locale);
+  return (
+    <>
+      <div className="aspect-video overflow-hidden bg-muted">
+        <TemplateCover template={template} getCover={getCover} alt={t("template_market.preview_alt", { title })} eager />
+      </div>
+      <div className="flex flex-col gap-4 border-t border-border px-6 py-5 sm:flex-row sm:items-end sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <DialogTitle className="text-lg">{title}</DialogTitle>
+            {isPptxCompatibleTemplate(template.manifest) ? <Badge className="text-[10px]">{t("template_market.pptx_compatible")}</Badge> : null}
+            <Badge variant="outline" className="text-[10px]">{t(CATEGORIES.find((item) => item.id === template.manifest.category)?.labelKey ?? "template_market.category.other")}</Badge>
+            <Badge variant="outline" className="text-[10px]">{templateStyleLabel(template.manifest.style)}</Badge>
+          </div>
+          <DialogDescription className="mt-2 max-w-2xl text-xs leading-5">{description}</DialogDescription>
+          <p className="mt-2 text-[10px] text-muted-foreground">{template.manifest.source.name} / {template.manifest.source.license}</p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="outline" size="sm" className="rounded-xl" onClick={onBack}>{t("common.back")}</Button>
+          <Button size="sm" className="rounded-xl" disabled={busyId !== null} onClick={template.updateAvailable || !template.installed ? onInstall : onUse}>
+            {busyId === template.manifest.id ? <Loader2 className="size-3.5 animate-spin" /> : null}
+            {template.updateAvailable ? t("template_market.update_template") : template.installed ? t("template_market.use_template") : t("template_market.install_template")}
+          </Button>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function TemplateCard({ template, getCover, busy, onPreview, onUse, onInstall, onUninstall }: { template: TemplateCatalogItem; getCover: TemplateCoverLoader; busy: boolean; onPreview: () => void; onUse: () => void; onInstall: () => void; onUninstall: () => void }) {
   const category = CATEGORIES.find((item) => item.id === template.manifest.category);
   const primaryAction = template.updateAvailable ? onInstall : template.installed ? onUse : onInstall;
   const primaryLabel = template.updateAvailable ? t("template_market.update") : template.installed ? t("template_market.use") : t("template_market.install");
-  return <article className="group overflow-hidden rounded-2xl border border-border bg-card shadow-sm transition hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-lg"><button type="button" className="relative block aspect-[16/9] w-full overflow-hidden bg-muted text-left" onClick={onPreview} aria-label={t("template_market.preview_aria", { title: template.manifest.title })}><TemplateCover template={template} getCover={getCover} alt={t("template_market.cover_alt", { title: template.manifest.title })} /><div className="absolute inset-x-0 bottom-0 flex items-end justify-between bg-gradient-to-t from-black/55 to-transparent p-3"><Badge variant="secondary" className="bg-black/35 text-[10px] text-white backdrop-blur">{category ? t(category.labelKey) : null}</Badge><span className="rounded-full bg-black/35 px-2 py-1 text-[10px] text-white backdrop-blur">{templateStyleLabel(template.manifest.style)}</span></div></button><div className="p-4"><div className="flex items-start gap-2"><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-1.5"><h3 className="truncate text-sm font-semibold">{template.manifest.title}</h3>{isPptxCompatibleTemplate(template.manifest) ? <Badge className="text-[10px]">{t("template_market.pptx_compatible")}</Badge> : null}</div><p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{template.manifest.description}</p></div><div className="flex items-center gap-1">{template.updateAvailable ? <Badge className="text-[10px]">{t("template_market.update")}</Badge> : null}{template.sourceType === "local" ? <Badge variant="outline" className="text-[10px]">{t("template_market.mine_badge")}</Badge> : <Badge variant="outline" className="text-[10px]">{t("template_market.official_badge")}</Badge>}{template.installed ? <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="size-7 rounded-lg text-muted-foreground" aria-label={t("template_market.more_actions_aria", { title: template.manifest.title })} />}><MoreHorizontal className="size-3.5" /></DropdownMenuTrigger><DropdownMenuContent align="end" className="min-w-36"><DropdownMenuItem variant="destructive" onClick={onUninstall}><Trash2 className="size-3.5" />{t("template_market.uninstall_template")}</DropdownMenuItem></DropdownMenuContent></DropdownMenu> : null}</div></div><div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-1.5"><span className="truncate text-[10px] text-muted-foreground">{template.manifest.tags.slice(0, 2).join(" / ") || template.manifest.subcategory}</span><Button variant="outline" size="sm" className="h-7 rounded-lg px-2 text-[11px]" onClick={onPreview}><Eye className="size-3" />{t("template_market.preview")}</Button><Button size="sm" className="h-7 rounded-lg px-2.5 text-[11px]" disabled={busy} onClick={primaryAction}>{busy ? <Loader2 className="size-3 animate-spin" /> : null}{primaryLabel}</Button></div></div></article>;
+  const locale = currentLocale();
+  const title = localizedTemplateTitle(template.manifest, locale);
+  const description = localizedTemplateDescription(template.manifest, locale);
+  const tags = localizedTemplateTags(template.manifest, locale);
+  return <article className="group overflow-hidden rounded-2xl border border-border bg-card shadow-sm transition hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-lg"><button type="button" className="relative block aspect-[16/9] w-full overflow-hidden bg-muted text-left" onClick={onPreview} aria-label={t("template_market.preview_aria", { title })}><TemplateCover template={template} getCover={getCover} alt={t("template_market.cover_alt", { title })} /><div className="absolute inset-x-0 bottom-0 flex items-end justify-between bg-gradient-to-t from-black/55 to-transparent p-3"><Badge variant="secondary" className="bg-black/35 text-[10px] text-white backdrop-blur">{category ? t(category.labelKey) : null}</Badge><span className="rounded-full bg-black/35 px-2 py-1 text-[10px] text-white backdrop-blur">{templateStyleLabel(template.manifest.style)}</span></div></button><div className="p-4"><div className="flex items-start gap-2"><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-1.5"><h3 className="truncate text-sm font-semibold">{title}</h3>{isPptxCompatibleTemplate(template.manifest) ? <Badge className="text-[10px]">{t("template_market.pptx_compatible")}</Badge> : null}</div><p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{description}</p></div><div className="flex items-center gap-1">{template.updateAvailable ? <Badge className="text-[10px]">{t("template_market.update")}</Badge> : null}{template.sourceType === "local" ? <Badge variant="outline" className="text-[10px]">{t("template_market.mine_badge")}</Badge> : <Badge variant="outline" className="text-[10px]">{t("template_market.official_badge")}</Badge>}{template.installed ? <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="size-7 rounded-lg text-muted-foreground" aria-label={t("template_market.more_actions_aria", { title })} />}><MoreHorizontal className="size-3.5" /></DropdownMenuTrigger><DropdownMenuContent align="end" className="min-w-36"><DropdownMenuItem variant="destructive" onClick={onUninstall}><Trash2 className="size-3.5" />{t("template_market.uninstall_template")}</DropdownMenuItem></DropdownMenuContent></DropdownMenu> : null}</div></div><div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-1.5"><span className="truncate text-[10px] text-muted-foreground">{tags.slice(0, 2).join(" / ") || template.manifest.subcategory}</span><Button variant="outline" size="sm" className="h-7 rounded-lg px-2 text-[11px]" onClick={onPreview}><Eye className="size-3" />{t("template_market.preview")}</Button><Button size="sm" className="h-7 rounded-lg px-2.5 text-[11px]" disabled={busy} onClick={primaryAction}>{busy ? <Loader2 className="size-3 animate-spin" /> : null}{primaryLabel}</Button></div></div></article>;
 }

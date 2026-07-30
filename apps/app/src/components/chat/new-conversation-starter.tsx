@@ -56,6 +56,7 @@ import { publicAssetUrl } from "@/app/lib/public-asset";
 import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { listSavedPromptTemplates, type SavedPromptTemplate } from "@/react-app/domains/session/templates/prompt-template-store";
+import { localizedTemplateTitle } from "@/react-app/domains/session/templates/template-localization";
 
 export type NewConversationMode = "work" | "code" | "design" | "video";
 
@@ -282,12 +283,13 @@ function TemplateStrip({
               const busy = busyId === template.manifest.id;
               const canUse = template.installed && Boolean(onUseTemplate);
               const label = template.installed ? t("new_conversation.templates.use") : t("new_conversation.templates.install");
+              const title = localizedTemplateTitle(template.manifest, typeof document !== "undefined" ? document.documentElement.lang : "en");
               return (
                 <button
                   key={template.manifest.id}
                   type="button"
                   disabled={busy || (!canUse && !onInstallTemplate)}
-                  aria-label={`${label}: ${template.manifest.title}`}
+                  aria-label={`${label}: ${title}`}
                   data-busy={busy ? "true" : undefined}
                   className="group relative h-[106px] min-w-[172px] snap-start overflow-hidden rounded-lg border border-border/80 bg-background text-left shadow-sm transition-[box-shadow,transform] hover:-translate-y-px hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:shadow-md disabled:cursor-not-allowed disabled:opacity-55 data-[busy=true]:shadow-md"
                   onClick={() => {
