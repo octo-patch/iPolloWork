@@ -9,6 +9,8 @@ import { inflateRaw } from "node:zlib";
 import {
   templateCategorySchema,
   templateManifestV1Schema,
+  templateLocaleSchema,
+  templateLocalizedMetadataSchema,
   templateSourceTypeSchema,
   templateStyleSchema,
   sortTemplatesForCatalog,
@@ -17,6 +19,7 @@ import {
   type TemplateCategory,
   type TemplateCatalogItem,
   type TemplateManifestV1,
+  type TemplateLocalizedMetadata,
   type TemplateSourceType,
   type TemplateSurface,
 } from "@ipollowork/types/templates";
@@ -37,6 +40,7 @@ const WITHDRAWN_BUNDLED_TEMPLATE_IDS = new Set([
 // workspace route remains the authorization and materialization boundary.
 const PERSONAL_TEMPLATE_LIBRARY = "__ipollowork_personal__";
 const ENTERPRISE_TEMPLATE_LIBRARY_PREFIX = "__ipollowork_enterprise__";
+const TEMPLATE_LOCALIZATION_BATCH_SIZE = 20;
 
 export type TemplateLibraryScope = "personal" | `enterprise:${string}`;
 
@@ -112,6 +116,11 @@ type TemplateDb = {
 
 type ZipEntry = { name: string; data: Buffer };
 type BundledTemplate = { manifest: TemplateManifestV1; directory: string; hash: string };
+type TemplateLocalizationInput = Pick<TemplateManifestV1, "id" | "title" | "description" | "tags" | "localizedMetadata">;
+export type TemplateLocalizationGenerator = (
+  templates: readonly TemplateLocalizationInput[],
+  targetLocales: readonly string[],
+) => Promise<Record<string, TemplateLocalizedMetadata>>;
 const dbByPath = new Map<string, Promise<TemplateDb>>();
 const operationQueues = new Map<string, Promise<void>>();
 let bundledTemplatePromise: Promise<BundledTemplate[]> | null = null;
@@ -496,7 +505,8 @@ async function installDirectory(input: {
     const current = db.get(input.workspaceId, input.manifest.id);
     if (!isDevelopmentVersion(pkg.version) && compareVersions(input.manifest.minimumAppVersion, pkg.version) > 0) throw new ApiError(409, "template_requires_newer_app", `This template requires iPolloWork ${input.manifest.minimumAppVersion} or newer`);
     if (current?.status === "installed" && current.version === input.manifest.version && current.packageHash === input.hash && existsSync(current.packagePath)) {
-      return { manifest: input.manifest, sourceType: input.sourceType, installed: true, installedVersion: current.version, updateAvailable: false, verified: input.sourceType !== "local" };
+      const persisted = templateManifestV1Schema.safeParse(JSON.parse(current.manifestJson));
+      return { manifest: persisted.success ? persisted.data : input.manifest, sourceType: input.sourceType, installed: true, installedVersion: current.version, updateAvailable: false, verified: input.sourceType !== "local" };
     }
     if (current?.status === "installed" && current.version === input.manifest.version && current.packageHash !== input.hash) throw new ApiError(409, "template_version_conflict", "A different package with this template version is already installed");
     const finalDirectory = join(templatesRoot(input.config), input.workspaceId, input.manifest.id, input.manifest.version);
@@ -538,7 +548,11 @@ export async function listTemplates(config: ServerConfig, workspaceId: string, s
   const byId = new Map(rows.map((row) => [row.templateId, row]));
   const items: TemplateCatalogItem[] = bundled.map((item) => {
     const row = byId.get(item.manifest.id);
-    return { manifest: item.manifest, sourceType: "bundled", installed: row?.status === "installed", installedVersion: row?.status === "installed" ? row.version : null, updateAvailable: row?.status === "installed" && compareVersions(item.manifest.version, row.version) > 0, verified: true };
+    const persisted = row ? templateManifestV1Schema.safeParse(JSON.parse(row.manifestJson)) : null;
+    const manifest = persisted?.success && persisted.data.version === item.manifest.version
+      ? { ...item.manifest, localizedMetadata: persisted.data.localizedMetadata }
+      : item.manifest;
+    return { manifest, sourceType: "bundled", installed: row?.status === "installed", installedVersion: row?.status === "installed" ? row.version : null, updateAvailable: row?.status === "installed" && compareVersions(item.manifest.version, row.version) > 0, verified: true };
   });
   for (const row of rows) {
     if (row.sourceType === "bundled" || row.status !== "installed") continue;
@@ -546,6 +560,70 @@ export async function listTemplates(config: ServerConfig, workspaceId: string, s
     if (parsed.success) items.push({ manifest: parsed.data, sourceType: row.sourceType, installed: true, installedVersion: row.version, updateAvailable: false, verified: row.sourceType === "market" });
   }
   return sortTemplatesForCatalog(items.map((item) => item.manifest)).map((manifest) => items.find((item) => item.manifest === manifest)!);
+}
+
+function canonicalTemplateLocale(locale: string): string | null {
+  const parsed = templateLocaleSchema.safeParse(locale);
+  if (!parsed.success) return null;
+  try { return Intl.getCanonicalLocales(parsed.data)[0] ?? null; }
+  catch { return null; }
+}
+
+function hasLocalizedMetadata(manifest: TemplateManifestV1, locale: string): boolean {
+  const metadata = manifest.localizedMetadata;
+  if (!metadata) return false;
+  if (metadata.sourceLocale.toLowerCase() === locale.toLowerCase()) return true;
+  return Object.keys(metadata.translations).some((candidate) => candidate.toLowerCase() === locale.toLowerCase());
+}
+
+export async function ensureTemplateLocalizations(
+  config: ServerConfig,
+  workspaceId: string,
+  scope: TemplateLibraryScope,
+  items: readonly TemplateCatalogItem[],
+  requestedLocales: readonly string[],
+  generate: TemplateLocalizationGenerator,
+): Promise<TemplateCatalogItem[]> {
+  if (config.readOnly) return [...items];
+  const targetLocales = Array.from(new Set(requestedLocales.map(canonicalTemplateLocale).filter((locale): locale is string => Boolean(locale))));
+  if (targetLocales.length === 0) return [...items];
+  const pending = items.filter((item) => targetLocales.some((locale) => !hasLocalizedMetadata(item.manifest, locale)));
+  if (pending.length === 0) return [...items];
+
+  const db = await templateDb(config);
+  const libraryId = templateLibraryId(scope);
+  const localizedById = new Map<string, TemplateManifestV1>();
+
+  for (let index = 0; index < pending.length; index += TEMPLATE_LOCALIZATION_BATCH_SIZE) {
+    const batch = pending.slice(index, index + TEMPLATE_LOCALIZATION_BATCH_SIZE);
+    let generated: Record<string, TemplateLocalizedMetadata>;
+    try {
+      generated = await generate(batch.map((item) => item.manifest), targetLocales);
+    } catch (error) {
+      if (config.logRequests) console.warn("[ipollowork-server] Template localization batch failed:", error instanceof Error ? error.message : String(error));
+      continue;
+    }
+    for (const item of batch) {
+      const parsed = templateLocalizedMetadataSchema.safeParse(generated[item.manifest.id]);
+      if (!parsed.success) continue;
+      const current = item.manifest.localizedMetadata;
+      const localizedMetadata = templateLocalizedMetadataSchema.parse({
+        sourceLocale: parsed.data.sourceLocale,
+        translations: { ...current?.translations, ...parsed.data.translations },
+        generatedAt: parsed.data.generatedAt ?? new Date().toISOString(),
+      });
+      const manifest = templateManifestV1Schema.parse({ ...item.manifest, localizedMetadata });
+      const row = db.get(libraryId, manifest.id);
+      if (!row || row.status !== "installed") continue;
+      db.upsert({ ...row, manifestJson: JSON.stringify(manifest), updatedAt: Date.now() });
+      localizedById.set(manifest.id, manifest);
+    }
+  }
+
+  return items.map((item) => {
+    const manifest = localizedById.get(item.manifest.id);
+    return manifest ? { ...item, manifest } : item;
+  });
 }
 
 export async function installBundledTemplate(config: ServerConfig, workspaceId: string, templateId: string, scope: TemplateLibraryScope = "personal") {
@@ -610,6 +688,7 @@ export async function saveTemplateFromSession(config: ServerConfig, workspace: W
   subcategory?: string;
   style?: string;
   tags?: string[];
+  sourceLocale?: string;
 }, scope: TemplateLibraryScope = "personal") {
   const category = templateCategorySchema.safeParse(input.category);
   if (!category.success) throw new ApiError(400, "invalid_template_category", "Unsupported template category");
@@ -635,6 +714,9 @@ export async function saveTemplateFromSession(config: ServerConfig, workspace: W
     surface,
     title,
     description: input.description?.trim().slice(0, 240) || `${scope === "personal" ? "Personal" : "Enterprise"} ${category.data} template`,
+    localizedMetadata: input.sourceLocale && canonicalTemplateLocale(input.sourceLocale)
+      ? { sourceLocale: canonicalTemplateLocale(input.sourceLocale), translations: {} }
+      : undefined,
     cover: "cover.svg",
     entry,
     source: { name: scope === "personal" ? "Personal template" : "Enterprise template", license: "Private" },

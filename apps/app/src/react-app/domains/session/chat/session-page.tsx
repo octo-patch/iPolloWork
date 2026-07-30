@@ -81,9 +81,10 @@ import { DesignPanel } from "../design/design-panel";
 import { designAiSelectionToken, type DesignAiSelectionContext } from "../design/design-ai-selection";
 import { useDesignAiSelectionStore } from "../design/design-ai-selection-store";
 import { waitForTemplateEntrySurface } from "../templates/template-entry-route";
+import { startTemplateCatalogPolling } from "../templates/template-catalog-polling";
 import {
   localizedTemplateDescription,
-  localizedTemplateTags,
+  templateCardTags,
   localizedTemplateTitle,
 } from "../templates/template-localization";
 import { loadTemplateSession } from "../templates/template-session-probe";
@@ -372,7 +373,7 @@ function DesignStarterTemplateCard({ client, workspaceId, item, busyId, onPrevie
   const locale = currentLocale();
   const title = localizedTemplateTitle(item.manifest, locale);
   const description = localizedTemplateDescription(item.manifest, locale);
-  const tags = localizedTemplateTags(item.manifest, locale);
+  const tags = templateCardTags(item.manifest, locale, t(`template_market.style.${item.manifest.style}`));
   return (
     <article className="group relative overflow-hidden rounded-2xl border border-dls-border bg-dls-surface transition hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-lg">
       <button type="button" className="block w-full text-left" onClick={onPreview} aria-label={t("template_market.preview_aria", { title })}>
@@ -609,12 +610,15 @@ export function SessionPage(props: SessionPageProps) {
     if (!props.selectedSessionId) return;
     setSidePanelState(props.selectedSessionId, "video");
   }, [props.selectedSessionId, setSidePanelState]);
-  const refreshTemplateCatalog = useCallback(async () => {
+  const refreshTemplateCatalog = useCallback(async (options?: { silent?: boolean }) => {
     if (!props.ipolloworkServerClient || !props.runtimeWorkspaceId) return;
-    setTemplateCatalogLoading(true);
-    setTemplateCatalogError(null);
+    const silent = options?.silent === true;
+    if (!silent) {
+      setTemplateCatalogLoading(true);
+      setTemplateCatalogError(null);
+    }
     try {
-      const localCatalog = await props.ipolloworkServerClient.listTemplates(props.runtimeWorkspaceId, templateResourceScope);
+      const localCatalog = await props.ipolloworkServerClient.listTemplates(props.runtimeWorkspaceId, templateResourceScope, [locale]);
       setTemplateCatalog(localCatalog.items);
       if (templateResourceScope !== "personal" && activeEnterprise) {
         setEnterpriseTemplateResources(await listEnterpriseResources(activeEnterprise, "template"));
@@ -622,9 +626,15 @@ export function SessionPage(props: SessionPageProps) {
         setEnterpriseTemplateResources([]);
       }
     }
-    catch (error) { setTemplateCatalogError(error instanceof Error ? error.message : t("templates.error_load")); }
-    finally { setTemplateCatalogLoading(false); }
-  }, [activeEnterprise, props.ipolloworkServerClient, props.runtimeWorkspaceId, templateResourceScope]);
+    catch (error) {
+      if (!silent) setTemplateCatalogError(error instanceof Error ? error.message : t("templates.error_load"));
+    }
+    finally { if (!silent) setTemplateCatalogLoading(false); }
+  }, [activeEnterprise, locale, props.ipolloworkServerClient, props.runtimeWorkspaceId, templateResourceScope]);
+  useEffect(() => {
+    if (!templateMarketOpen) return;
+    return startTemplateCatalogPolling(() => { void refreshTemplateCatalog({ silent: true }); });
+  }, [refreshTemplateCatalog, templateMarketOpen]);
   const getTemplateCover = useCallback((templateId: string) => {
     if (!props.ipolloworkServerClient || !props.runtimeWorkspaceId) {
       return Promise.reject(new Error("Template cover is unavailable."));
@@ -726,7 +736,7 @@ export function SessionPage(props: SessionPageProps) {
     templateImportInFlightRef.current = true;
     setTemplateBusyId("import");
     try {
-      const result = await props.ipolloworkServerClient.importTemplate(props.runtimeWorkspaceId, file, category, templateResourceScope);
+      const result = await props.ipolloworkServerClient.importTemplate(props.runtimeWorkspaceId, file, category, templateResourceScope, [locale]);
       toast.success(t("templates.toast_installed", { title: localizedTemplateTitle(result.item.manifest, currentLocale()) }));
       await refreshTemplateCatalog();
       return true;
@@ -737,7 +747,7 @@ export function SessionPage(props: SessionPageProps) {
       templateImportInFlightRef.current = false;
       setTemplateBusyId(null);
     }
-  }, [props.ipolloworkServerClient, props.runtimeWorkspaceId, refreshTemplateCatalog, templateResourceScope]);
+  }, [locale, props.ipolloworkServerClient, props.runtimeWorkspaceId, refreshTemplateCatalog, templateResourceScope]);
   const installEnterpriseTemplate = useCallback(async (resource: EnterpriseResource) => {
     if (!activeEnterprise || templateResourceScope === "personal") return;
     setTemplateBusyId(resource.id);

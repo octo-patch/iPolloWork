@@ -1183,6 +1183,9 @@ export function createiPolloWorkServerClient(options: { baseUrl: string; token?:
   const resourceScopeHeaders = (scope: iPolloWorkResourceScope = "personal") => ({
     "X-iPolloWork-Resource-Scope": scope,
   });
+  const templateLocaleHeaders = (locales: readonly string[] = []): Record<string, string> => locales.length
+    ? { "X-iPolloWork-Template-Locales": locales.join(",") }
+    : {};
 
   const timeouts = {
     health: 3_000,
@@ -1196,6 +1199,7 @@ export function createiPolloWorkServerClient(options: { baseUrl: string; token?:
     config: 10_000,
     workspaceExport: 30_000,
     workspaceImport: 30_000,
+    templateLocalization: 120_000,
     binary: 60_000,
   };
 
@@ -1303,13 +1307,13 @@ export function createiPolloWorkServerClient(options: { baseUrl: string; token?:
         `/workspace/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}`,
         { token, hostToken, method: "DELETE", timeoutMs: timeouts.deleteSession },
       ),
-    listTemplates: (workspaceId: string, scope: iPolloWorkResourceScope = "personal") =>
-      requestJson<{ items: TemplateCatalogItem[] }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/templates`, { token, hostToken, headers: resourceScopeHeaders(scope) }),
+    listTemplates: (workspaceId: string, scope: iPolloWorkResourceScope = "personal", locales: readonly string[] = []) =>
+      requestJson<{ items: TemplateCatalogItem[] }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/templates`, { token, hostToken, headers: { ...resourceScopeHeaders(scope), ...templateLocaleHeaders(locales) }, timeoutMs: timeouts.templateLocalization }),
     listHyperframesCatalog: (workspaceId: string) =>
       requestJson<{ items: HyperframesCatalogItem[] }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/hyperframes-catalog`, { token, hostToken }),
     installTemplate: (workspaceId: string, templateId: string, scope: iPolloWorkResourceScope = "personal") =>
       requestJson<{ item: TemplateCatalogItem }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/templates/${encodeURIComponent(templateId)}/install`, { token, hostToken, method: "POST", headers: resourceScopeHeaders(scope), timeoutMs: timeouts.workspaceImport }),
-    importTemplate: (workspaceId: string, file: File, category?: TemplateCategory, scope: iPolloWorkResourceScope = "personal") =>
+    importTemplate: (workspaceId: string, file: File, category?: TemplateCategory, scope: iPolloWorkResourceScope = "personal", locales: readonly string[] = []) =>
       requestRawJson<{ item: TemplateCatalogItem }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/templates/import`, {
         token,
         hostToken,
@@ -1318,18 +1322,19 @@ export function createiPolloWorkServerClient(options: { baseUrl: string; token?:
           "Content-Type": "application/vnd.ipollowork-template+zip",
           "X-iPolloWork-Filename": encodeURIComponent(file.name),
           ...resourceScopeHeaders(scope),
+          ...templateLocaleHeaders(locales),
           ...(category ? { "X-iPolloWork-Template-Category": category } : {}),
         },
-        timeoutMs: timeouts.workspaceImport,
+        timeoutMs: timeouts.templateLocalization,
       }),
-    saveTemplateFromSession: (workspaceId: string, input: { sessionId: string; category: TemplateManifestV1["category"]; title: string; description?: string; subcategory?: string; style?: TemplateManifestV1["style"]; tags?: string[] }, scope: iPolloWorkResourceScope = "personal") =>
+    saveTemplateFromSession: (workspaceId: string, input: { sessionId: string; category: TemplateManifestV1["category"]; title: string; description?: string; subcategory?: string; style?: TemplateManifestV1["style"]; tags?: string[]; sourceLocale?: string }, scope: iPolloWorkResourceScope = "personal", locales: readonly string[] = []) =>
       requestJson<{ item: TemplateCatalogItem }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/templates/from-session`, {
         token,
         hostToken,
         method: "POST",
         body: input,
-        headers: resourceScopeHeaders(scope),
-        timeoutMs: timeouts.workspaceImport,
+        headers: { ...resourceScopeHeaders(scope), ...templateLocaleHeaders(locales) },
+        timeoutMs: timeouts.templateLocalization,
       }),
     uninstallTemplate: (workspaceId: string, templateId: string, scope: iPolloWorkResourceScope = "personal") =>
       requestJson<{ ok: boolean }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/templates/${encodeURIComponent(templateId)}`, { token, hostToken, method: "DELETE", headers: resourceScopeHeaders(scope), timeoutMs: timeouts.workspaceImport }),

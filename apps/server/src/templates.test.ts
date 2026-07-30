@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { deflateRawSync } from "node:zlib";
 import { TEMPLATE_STYLE_LABELS, type TemplateManifestV1 } from "@ipollowork/types/templates";
 import type { ServerConfig, WorkspaceInfo } from "./types.js";
-import { adoptLegacyVideoSession, importTemplate, listTemplates, materializeTemplate, migrateTemplateSessionSnapshots, parseTemplateLibraryScope, readTemplateSession, resolveBundledTemplatesRoot, saveTemplateFromSession, uninstallTemplate } from "./templates.js";
+import { adoptLegacyVideoSession, ensureTemplateLocalizations, importTemplate, listTemplates, materializeTemplate, migrateTemplateSessionSnapshots, parseTemplateLibraryScope, readTemplateSession, resolveBundledTemplatesRoot, saveTemplateFromSession, uninstallTemplate } from "./templates.js";
 
 const previousRuntimeDb = process.env.IPOLLOWORK_RUNTIME_DB;
 const previousBundledTemplatesDir = process.env.IPOLLOWORK_BUNDLED_TEMPLATES_DIR;
@@ -887,6 +887,79 @@ describe("template installations", () => {
     await expect(importTemplate(serverConfig, "alpha", localPackage(), "slides")).rejects.toMatchObject({ code: "template_category_mismatch" });
     await expect(importTemplate(serverConfig, "alpha", localPackage("local.invalid-video", { category: "video", surface: "video" }), "video")).rejects.toMatchObject({ code: "invalid_template_manifest" });
   });
+
+  test("generates and persists missing template locales without template-specific mappings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ipw-template-locales-"));
+    process.env.IPOLLOWORK_RUNTIME_DB = join(root, "runtime.sqlite");
+    const serverConfig = config(root);
+    const archive = localPackage("partner.unknown-template");
+    const installed = await importTemplate(serverConfig, "alpha", archive, "site");
+    let calls = 0;
+
+    const localized = await ensureTemplateLocalizations(
+      serverConfig,
+      "alpha",
+      "personal",
+      [installed],
+      ["zh"],
+      async (templates, targetLocales) => {
+        calls += 1;
+        expect(templates.map((template) => template.id)).toEqual(["partner.unknown-template"]);
+        expect(targetLocales).toEqual(["zh"]);
+        return {
+          "partner.unknown-template": {
+            sourceLocale: "en",
+            translations: {
+              zh: { title: "简洁作品集", description: "紧凑的本地作品集模板。", tags: ["作品集"] },
+            },
+          },
+        };
+      },
+    );
+
+    expect(localized[0]?.manifest.localizedMetadata?.translations.zh?.title).toBe("简洁作品集");
+    const persisted = (await listTemplates(serverConfig, "beta")).find((item) => item.manifest.id === installed.manifest.id);
+    expect(persisted?.manifest.localizedMetadata?.translations.zh?.description).toBe("紧凑的本地作品集模板。");
+    expect((await importTemplate(serverConfig, "alpha", archive, "site")).manifest.localizedMetadata?.translations.zh?.title).toBe("简洁作品集");
+
+    await ensureTemplateLocalizations(serverConfig, "alpha", "personal", localized, ["zh"], async () => {
+      calls += 1;
+      return {};
+    });
+    expect(calls).toBe(1);
+  }, 15_000);
+
+  test("keeps successful localization batches when a later batch fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ipw-template-locale-batches-"));
+    process.env.IPOLLOWORK_RUNTIME_DB = join(root, "runtime.sqlite");
+    const serverConfig = config(root);
+    const installed = await Promise.all(Array.from({ length: 21 }, (_, index) =>
+      importTemplate(serverConfig, "alpha", localPackage(`partner.batch-${index}`), "site")));
+    let calls = 0;
+
+    const localized = await ensureTemplateLocalizations(
+      serverConfig,
+      "alpha",
+      "personal",
+      installed,
+      ["zh"],
+      async (templates) => {
+        calls += 1;
+        if (calls === 2) throw new Error("provider unavailable");
+        return Object.fromEntries(templates.map((template) => [template.id, {
+          sourceLocale: "en",
+          translations: {
+            zh: { title: `中文 ${template.id}`, description: "已翻译的模板描述。", tags: ["极简"] },
+          },
+        }]));
+      },
+    );
+
+    expect(calls).toBe(2);
+    expect(localized.filter((item) => item.manifest.localizedMetadata?.translations.zh).length).toBe(20);
+    expect((await listTemplates(serverConfig, "beta"))
+      .filter((item) => item.manifest.localizedMetadata?.translations.zh).length).toBe(20);
+  }, 20_000);
 
   test("auto-detects imported categories while preserving scoped import checks", async () => {
     const root = await mkdtemp(join(tmpdir(), "ipw-import-category-"));

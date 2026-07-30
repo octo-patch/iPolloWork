@@ -65,6 +65,20 @@ export const templateVariableSchema = z.object({
   group: z.enum(["theme", "background", "typography", "components", "content", "brand"]),
 }).strict();
 
+export const templateLocaleSchema = z.string().trim().regex(/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/).max(35);
+
+export const templateLocalizedMetadataEntrySchema = z.object({
+  title: z.string().trim().min(1).max(96),
+  description: z.string().trim().min(1).max(240),
+  tags: z.array(z.string().trim().min(1).max(32)).max(12),
+}).strict();
+
+export const templateLocalizedMetadataSchema = z.object({
+  sourceLocale: templateLocaleSchema,
+  translations: z.record(templateLocaleSchema, templateLocalizedMetadataEntrySchema),
+  generatedAt: z.string().datetime().optional(),
+}).strict();
+
 export const templateManifestV1Schema = z.object({
   schemaVersion: z.literal(1),
   id: z.string().regex(/^[a-z0-9]+(?:[.-][a-z0-9]+)+$/).max(128),
@@ -78,6 +92,7 @@ export const templateManifestV1Schema = z.object({
   surface: templateSurfaceSchema.default("design"),
   title: z.string().trim().min(1).max(96),
   description: z.string().trim().min(1).max(240),
+  localizedMetadata: templateLocalizedMetadataSchema.optional(),
   cover: z.string().trim().min(1),
   entry: z.string().trim().min(1),
   source: z.object({
@@ -118,6 +133,8 @@ export type TemplateSurface = z.infer<typeof templateSurfaceSchema>;
 export type TemplateStyle = z.infer<typeof templateStyleSchema>;
 export type TemplateVariable = z.infer<typeof templateVariableSchema>;
 export type PptxCompatibility = z.infer<typeof pptxCompatibilitySchema>;
+export type TemplateLocalizedMetadata = z.infer<typeof templateLocalizedMetadataSchema>;
+export type TemplateLocalizedMetadataEntry = z.infer<typeof templateLocalizedMetadataEntrySchema>;
 
 type PptxCompatibilityTemplate = Pick<TemplateManifestV1, "category" | "pptxCompatibility">;
 type CatalogSortTemplate = Pick<TemplateManifestV1, "category" | "title" | "pptxCompatibility">;

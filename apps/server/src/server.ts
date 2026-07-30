@@ -107,6 +107,7 @@ import { buildiPolloWorkRuntimeConfigObject } from "./ipollowork-runtime-config.
 import {
   MAX_TEMPLATE_PACKAGE_BYTES,
   adoptLegacyVideoSession,
+  ensureTemplateLocalizations,
   importTemplate,
   installBundledTemplate,
   listTemplateSessions,
@@ -119,6 +120,9 @@ import {
   saveTemplateFromSession,
   uninstallTemplate,
 } from "./templates.js";
+import type { TemplateCatalogItem, TemplateLocalizedMetadata } from "@ipollowork/types/templates";
+import { disabledTemplateLocalizationTools, parseTemplateLocalizationText } from "./template-localization-output.js";
+import { BackgroundTaskQueue } from "./template-localization-queue.js";
 import pkg from "../package.json" with { type: "json" };
 import constants from "../../../constants.json" with { type: "json" };
 import { listHyperframesCatalog } from "./hyperframes-catalog.js";
@@ -135,6 +139,7 @@ const OPENCODE_VERSION = constants.opencodeVersion.trim().replace(/^v/, "");
 const IPOLLOWORK_VOICE_REALTIME_MODEL = "gpt-realtime-2";
 const IPOLLOWORK_VOICE_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 let desktopCloudSyncQueue: Promise<void> = Promise.resolve();
+const templateLocalizationQueue = new BackgroundTaskQueue();
 
 const IPOLLOWORK_VOICE_REALTIME_TOOLS = [
   {
@@ -974,6 +979,79 @@ function unwrapOpencodeResult<T, E>(result: OpencodeClientResult<T, E>, path: st
   });
 }
 
+function requestedTemplateLocales(request: Request): string[] {
+  return (request.headers.get("x-ipollowork-template-locales") ?? "")
+    .split(",")
+    .map((locale) => locale.trim())
+    .filter(Boolean);
+}
+
+async function generateTemplateLocalizations(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  templates: readonly Pick<TemplateCatalogItem["manifest"], "id" | "title" | "description" | "tags">[],
+  targetLocales: readonly string[],
+): Promise<Record<string, TemplateLocalizedMetadata>> {
+  const opencode = createWorkspaceOpencodeClient(config, workspace);
+  const toolIds = unwrapOpencodeResult(await opencode.tool.ids(), "/experimental/tool/ids");
+  const session = unwrapOpencodeResult(await opencode.session.create({ title: "Localize template metadata" }), "/session");
+  try {
+    const response = unwrapOpencodeResult(await opencode.session.prompt({
+      sessionID: session.id,
+      tools: disabledTemplateLocalizationTools(toolIds),
+      system: "Translate template catalog metadata accurately. Return only valid JSON with this shape: {\"templates\":[{\"id\":string,\"sourceLocale\":string,\"translations\":[{\"locale\":string,\"title\":string,\"description\":string,\"tags\":string[]}]}]}. Use BCP 47 language codes such as en, zh, ja, and pt-BR. Preserve product names, trademarks, and technical terms when appropriate. Return every requested template and locale. Keep titles concise, descriptions natural, and tags short. Do not add facts or Markdown fences.",
+      parts: [{
+        type: "text",
+        text: JSON.stringify({ targetLocales, templates: templates.map(({ id, title, description, tags }) => ({ id, title, description, tags })) }),
+      }],
+    }), `/session/${encodeURIComponent(session.id)}/message`);
+    return parseTemplateLocalizationText(response.parts
+      .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+      .map((part) => part.text)
+      .join("\n"));
+  } finally {
+    await opencode.session.delete({ sessionID: session.id }).catch(() => undefined);
+  }
+}
+
+async function localizeTemplateCatalog(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  scope: ReturnType<typeof parseTemplateLibraryScope>,
+  items: readonly TemplateCatalogItem[],
+  locales: readonly string[],
+): Promise<TemplateCatalogItem[]> {
+  if (locales.length === 0) return [...items];
+  try {
+    return await ensureTemplateLocalizations(
+      config,
+      workspace.id,
+      scope,
+      items,
+      locales,
+      (templates, targetLocales) => generateTemplateLocalizations(config, workspace, templates, targetLocales),
+    );
+  } catch (error) {
+    if (config.logRequests) console.warn("[ipollowork-server] Template localization failed:", error instanceof Error ? error.message : String(error));
+    return [...items];
+  }
+}
+
+function scheduleTemplateCatalogLocalization(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  scope: ReturnType<typeof parseTemplateLibraryScope>,
+  items: readonly TemplateCatalogItem[],
+  locales: readonly string[],
+): void {
+  const requested = Array.from(new Set(locales.map((locale) => locale.trim()).filter(Boolean))).sort();
+  if (requested.length === 0) return;
+  const key = [runtimeDbPathForServer(config), workspace.id, scope, ...requested].join("\u0000");
+  templateLocalizationQueue.schedule(key, async () => {
+    await localizeTemplateCatalog(config, workspace, scope, items, requested);
+  });
+}
+
 async function proxyOpencodeRequest(input: {
   config: ServerConfig;
   request: Request;
@@ -1073,7 +1151,7 @@ function withCors(response: Response, request: Request, config: ServerConfig) {
   headers.set("Access-Control-Allow-Origin", allowOrigin);
   headers.set(
     "Access-Control-Allow-Headers",
-    "Authorization, Content-Type, X-iPolloWork-Host-Token, X-iPolloWork-Client-Id, X-iPolloWork-Filename, X-iPolloWork-Resource-Scope, X-iPolloWork-Template-Category, X-OpenCode-Directory, X-Opencode-Directory, x-opencode-directory",
+    "Authorization, Content-Type, X-iPolloWork-Host-Token, X-iPolloWork-Client-Id, X-iPolloWork-Filename, X-iPolloWork-Resource-Scope, X-iPolloWork-Template-Category, X-iPolloWork-Template-Locales, X-OpenCode-Directory, X-Opencode-Directory, x-opencode-directory",
   );
   headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   headers.set("Vary", "Origin");
@@ -1449,7 +1527,9 @@ function createRoutes(
   addRoute(routes, "GET", "/workspace/:id/templates", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const scope = parseTemplateLibraryScope(ctx.request.headers.get("x-ipollowork-resource-scope"));
-    return jsonResponse({ items: await listTemplates(config, workspace.id, scope) });
+    const items = await listTemplates(config, workspace.id, scope);
+    scheduleTemplateCatalogLocalization(config, workspace, scope, items, requestedTemplateLocales(ctx.request));
+    return jsonResponse({ items });
   });
 
   addRoute(routes, "GET", "/workspace/:id/hyperframes-catalog", "client", async (ctx) => {
@@ -1473,7 +1553,9 @@ function createRoutes(
     const category = ctx.request.headers.get("x-ipollowork-template-category")?.trim();
     const archive = await readLimitedRequestBody(ctx.request, MAX_TEMPLATE_PACKAGE_BYTES);
     if (archive.byteLength === 0) throw new ApiError(400, "empty_template_package", "Choose a .ipwt template package");
-    return jsonResponse({ item: await importTemplate(config, workspace.id, archive, category, scope) }, 201);
+    const item = await importTemplate(config, workspace.id, archive, category, scope);
+    const [localized] = await localizeTemplateCatalog(config, workspace, scope, [item], requestedTemplateLocales(ctx.request));
+    return jsonResponse({ item: localized ?? item }, 201);
   });
 
   addRoute(routes, "POST", "/workspace/:id/templates/from-session", "client", async (ctx) => {
@@ -1487,7 +1569,7 @@ function createRoutes(
     const category = typeof body.category === "string" ? body.category : "";
     const title = typeof body.title === "string" ? body.title : "";
     if (!sessionId || !category || !title) throw new ApiError(400, "invalid_payload", "sessionId, category and title are required");
-    return jsonResponse({ item: await saveTemplateFromSession(config, workspace, {
+    const item = await saveTemplateFromSession(config, workspace, {
       sessionId,
       category: category as import("@ipollowork/types/templates").TemplateCategory,
       title,
@@ -1495,7 +1577,10 @@ function createRoutes(
       subcategory: typeof body.subcategory === "string" ? body.subcategory : undefined,
       style: typeof body.style === "string" ? body.style : undefined,
       tags: Array.isArray(body.tags) ? body.tags.filter((tag): tag is string => typeof tag === "string") : undefined,
-    }, scope) }, 201);
+      sourceLocale: typeof body.sourceLocale === "string" ? body.sourceLocale : undefined,
+    }, scope);
+    const [localized] = await localizeTemplateCatalog(config, workspace, scope, [item], requestedTemplateLocales(ctx.request));
+    return jsonResponse({ item: localized ?? item }, 201);
   });
 
   addRoute(routes, "POST", "/workspace/:id/templates/:templateId/install", "client", async (ctx) => {
